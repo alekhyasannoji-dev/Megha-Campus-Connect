@@ -1,0 +1,126 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * MECHA CAMPUS CONNECT SECURITY RULES
+     *
+     * CORE PHILOSOPHY:
+     * This ruleset implements a robust, owner-based security model designed for rapid prototyping.
+     * It prioritizes strict authorization (who can access what) while remaining flexible on
+     * data schemas to allow for iterative development.
+     *
+     * DATA STRUCTURE:
+     * - /users/{userId}: Private user profiles, strictly owned by the authenticated user.
+     * - /events/{eventId}: Publicly viewable campus events, manageable only by their creators.
+     * - /events/{eventId}/registrations/{registrationId}: Private registration records accessible
+     *   by both the registrant (student) and the event organizer.
+     * - /feedback/{feedbackId}: Publicly writable but shared readable feedback.
+     *
+     * KEY SECURITY DECISIONS:
+     * - DENORMALIZATION: The 'eventCreatorId' is denormalized into registration documents. This
+     *   allows the security rules to verify the event creator's access without performing expensive
+     *   cross-document 'get()' lookups on the parent 'Event' document.
+     * - PATH INTEGRITY: We enforce that internal document fields (like 'userId' or 'id') match
+     *   the Firestore document path during creation to prevent data spoofing.
+     * - READ ACCESSIBILITY: Events are readable by any authenticated user, but user profiles and
+     *   registrations are restricted to involved parties.
+     */
+
+    // --- GLOBAL HELPER FUNCTIONS ---
+
+    /** Checks if the request is from a signed-in user. */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /** Checks if the provided UID matches the authenticated user's UID. */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /** Checks ownership and ensures the document exists for state-changing operations. */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+
+    /** Checks if the UID matches a field within the document's data. */
+    function isDataOwner(ownerId) {
+      return isSignedIn() && request.auth.uid == ownerId;
+    }
+
+    /** Checks data-based ownership for existing documents. */
+    function isExistingDataOwner(ownerId) {
+      return isDataOwner(ownerId) && resource != null;
+    }
+
+    /** Checks if the user is either the registrant or the creator of the associated event. */
+    function canAccessRegistration(registrantId, eventCreatorId) {
+      return isSignedIn() && (request.auth.uid == registrantId || request.auth.uid == eventCreatorId);
+    }
+
+    // --- COLLECTION RULES ---
+
+    /**
+     * @description Rules for the UserProfile collection. Ensures users can only access their own profile.
+     * @path /users/{userId}
+     * @allow (get, list, create, update) if the authenticated user's UID matches the {userId} path.
+     * @deny (get) if an authenticated user tries to access a different user's document.
+     * @principle Path-based ownership and relational integrity (enforcing ID consistency).
+     */
+    match /users/{userId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Rules for the Event collection. Allows public read for all users, but restricted write for creators.
+     * @path /events/{eventId}
+     * @allow (get, list) for any authenticated user.
+     * @allow (create) if the 'createdBy' field matches the authenticated user's UID.
+     * @deny (update) if a user who did not create the event tries to modify it.
+     * @principle Public Read with Owner-Only Writes.
+     */
+    match /events/{eventId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isExistingDataOwner(resource.data.createdBy) && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if isExistingDataOwner(resource.data.createdBy);
+
+      /**
+       * @description Rules for registrations under an event. Accessible by the registrant and the event creator.
+       * @path /events/{eventId}/registrations/{registrationId}
+       * @allow (get, list) if user is the registrant OR the event organizer (via denormalized eventCreatorId).
+       * @allow (create) if the registrant's 'userId' matches the authenticated user.
+       * @deny (delete) if an unauthorized user attempts to remove a registration.
+       * @principle Shared access via denormalization for authorization performance.
+       */
+      match /registrations/{registrationId} {
+        allow get, list: if canAccessRegistration(resource.data.userId, resource.data.eventCreatorId);
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update: if isExistingDataOwner(resource.data.userId) && request.resource.data.userId == resource.data.userId;
+        allow delete: if isExistingDataOwner(resource.data.userId) || isExistingDataOwner(resource.data.eventCreatorId);
+      }
+    }
+
+    /**
+     * @description Rules for the Feedback collection.
+     * @path /feedback/{feedbackId}
+     * @allow read, create if the user is authenticated.
+     */
+    match /feedback/{feedbackId} {
+      allow read, create: if isSignedIn();
+    }
+
+    /**
+     * @description Collection group rules for registrations to allow users to see all their own registrations.
+     * @principle Query security allowing filtering across different events for a single user.
+     */
+    match /{path=**}/registrations/{registrationId} {
+      allow read: if isSignedIn() && (request.auth.uid == resource.data.userId || request.auth.uid == resource.data.eventCreatorId);
+    }
+  }
+}
